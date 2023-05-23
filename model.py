@@ -124,8 +124,15 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config,emb_gpt):
         super().__init__()
+        self.emb_gpt=emb_gpt
+        if emb_gpt:
+            self.init_emb_gpt(config)
+        else:
+            self.init_non_emb_gpt(config)
+
+    def init_emb_gpt(self,config):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
@@ -154,6 +161,28 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+    def init_non_emb_gpt(self,config):
+    
+        assert config.block_size is not None
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, 1, bias=False)
+
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
+        # report number of parameters
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -163,7 +192,8 @@ class GPT(nn.Module):
         """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+            if hasattr(self.transformer,'wpe'):
+                n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -173,16 +203,27 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def forward(self,idx,targets=None):
+        if self.emb_gpt:
+            return self.emb_forward(idx,targets)
+        else:
+            return self.non_emb_forward(idx,targets)
 
-    def forward(self, idx, targets=None):
+    def emb_forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
+        print(f"batch {b}, t {t}")
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+
+        print("tok_emb size: ")
+        print(tok_emb.size())
+        print("pos_emb size: ")
+        print(pos_emb.size())
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
@@ -198,6 +239,35 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
+
+    def non_emb_forward(self, idx, targets=None):
+        device = idx.device
+        b, t, c = idx.size()
+        print(f"batch {b}, t {t}")
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        #pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+
+        # forward the GPT model itself
+        #tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        #pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+
+        #x = self.transformer.drop(idx)
+        x=idx
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            out = self.lm_head(x)
+            loss =F.mse_loss(out,targets) 
+            #F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            out = self.lm_head(x) # note: using list [-1] to preserve the time dim
+            loss = None
+
+        return out, loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
